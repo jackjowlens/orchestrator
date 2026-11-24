@@ -64,9 +64,10 @@ class Event:
 
 
 class Engine:
-    def __init__(self, initial: dict[Slice, Values], *, capacity=256, history=2048):
+    def __init__(self, initial: dict[Slice, Values], *, capacity=256, history=2048, on_event=None):
         if any(type(n) is not int or n < 1 for n in (capacity, history)):
             raise ValueError("positive limits required")
+        self._on_event = on_event
         self._data = dict(initial)
         validate_data(self._data)
         self._capacity = capacity
@@ -82,7 +83,10 @@ class Engine:
 
     def _emit(self, run, req, state, blocker=None):
         self._sequence += 1
-        self._events.append(Event(self._sequence, run, req, state, blocker))
+        event = Event(self._sequence, run, req, state, blocker)
+        self._events.append(event)
+        if self._on_event is not None:
+            self._on_event(event)
 
     def _rank(self, run, req):
         # Ties favor FIFO: a scheduled arrival can pass four recent manual arrivals.
