@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import secrets
+from time import perf_counter_ns
 from scheduler import periodic
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
@@ -43,21 +44,38 @@ class Service:
         if event.blocker:
             owner, key = event.blocker
             blocker = f"#{owner} · {key.source} · {key.day}"
+            other = self.rows[owner]
+            resource = [key.source, str(key.day)]
+            row["waits"].append(dict(owner=owner, process=other["process"], resource=resource,
+                                     mode="write" if key in event.request.writes else "read",
+                                     owner_mode="write" if resource in other["writes"] else "read",
+                                     queued=other["state"] != "RUNNING"))
+        row["timing"].append([event.state, perf_counter_ns() // 1000])
         stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         row.update(state=event.state, blocker=blocker)
         row["events"].append([stamp, event.state, blocker])
         self.notify()
 
-    async def submit(self, process, day, actor, trigger="manual", delay=0):
+    async def submit(self, process, day, actor, trigger="manual", delay=0, values=None):
         req, worker = bind(process, day, actor, trigger)
+        if values is not None:
+            if process != "P1" or type(values) is not list or not 1 <= len(values) <= 128:
+                raise ValueError("invalid input series")
+            if any(type(n) is not int or abs(n) > 10**9 for n in values):
+                raise ValueError("invalid input number")
+            series = tuple(values)
         admitted = asyncio.get_running_loop().create_future()
-        row = dict(process=process, day=str(day), actor=actor, trigger=trigger, events=[],
-                   result=None, error=None)
+        row = dict(process=process, day=str(day), actor=actor, trigger=trigger, events=[], hold=delay,
+                   result=None, error=None, waits=[], timing=[], values=values,
+                   reads=[[k.source, str(k.day)] for k in sorted(req.reads)],
+                   writes=[[k.source, str(k.day)] for k in sorted(req.writes)])
         self.pending[id(req)] = row, admitted
 
         async def compute(inputs):
             if delay:
                 await asyncio.sleep(delay)
+            if values is not None:
+                return sum(series), {next(iter(req.writes)): series}
             return await worker(inputs)
 
         async def execute():
@@ -106,13 +124,16 @@ def create_app(interval=60):
             raise web.HTTPUnsupportedMediaType()
         try:
             body = await request.json()
-            if type(body) is not dict or set(body) != {"process", "day"}:
+            if type(body) is not dict or not {"process", "day"} <= set(body) <= {"process", "day", "values", "hold"}:
                 raise ValueError()
             day = date.fromisoformat(body["day"])
             actor, _, signature = request.cookies.get("operator", "").partition(".")
             if len(actor) != 12 or not signature.isascii() or not hmac.compare_digest(signature, sign(actor)):
                 actor = uuid4().hex[:12]
-            run = await service.submit(body["process"], day, actor)
+            hold = body.get("hold", 0)
+            if type(hold) is not int or hold not in (0, 3, 8):
+                raise ValueError()
+            run = await service.submit(body["process"], day, actor, delay=hold, values=body.get("values"))
         except (ValueError, KeyError, TypeError, OverflowError):
             raise web.HTTPBadRequest(text="Проверьте процесс и дату.")
         except BufferError:
@@ -126,12 +147,27 @@ def create_app(interval=60):
     async def demo(request):
         if request.content_type != "application/json":
             raise web.HTTPUnsupportedMediaType()
+        try:
+            body = await request.json()
+            scenario = body.get("scenario", "refresh")
+            yesterday = DAY - timedelta(days=1)
+            plans = {
+                "refresh": [("P1", DAY, 3), ("P2", DAY, 0), ("P2", yesterday, 0)],
+                "window": [("P5", yesterday, 4), ("P4", DAY, 0), ("P2", DAY, 0)],
+                "writers": [("P3", DAY, 4), ("P3", DAY, 0)],
+                "queue": [("P2", DAY, 4), ("P5", DAY, 2), ("P2", DAY, 0)],
+            }
+            plan = plans[scenario]
+        except (ValueError, AttributeError, KeyError, TypeError):
+            raise web.HTTPBadRequest(text="Неизвестный сценарий.")
         if demo_lock.locked() or service.jobs:
             raise web.HTTPConflict(text="Дождитесь завершения активных запусков.")
         async with demo_lock:
-            ids = [await service.submit("P1", DAY, "timer", "scheduled", delay=3)]
-            for day in (DAY, DAY - timedelta(days=1)):
-                ids.append(await service.submit("P2", day, "demo"))
+            ids = []
+            for index, (process, day, delay) in enumerate(plan):
+                trigger = "manual" if index else "scheduled"
+                actor = f"оператор-{index}" if index else "timer"
+                ids.append(await service.submit(process, day, actor, trigger, delay))
         return web.json_response({"ids": ids}, status=202)
 
     async def stream(request):
@@ -184,4 +220,7 @@ def create_app(interval=60):
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="127.0.0.1", port=8080, handler_cancellation=True)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8080)
+    web.run_app(create_app(), host="127.0.0.1", port=parser.parse_args().port, handler_cancellation=True)
