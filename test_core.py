@@ -218,3 +218,109 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         for key in keys:
             self.assertEqual(await self.engine.execute(request([key]), total), replay[key])
 
+
+class BackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bypass_limit_and_write_isolation(self):
+        engine = Engine({A: (1,), B: (2,)}, backfill_limit=2)
+        owner = Gate({A: (6,)})
+        writer = Gate({A: (7,), B: (8,)})
+        first = asyncio.create_task(engine.execute(request(write=[A]), owner))
+        async with asyncio.timeout(3):
+            await owner.entered.wait()
+            blocked = asyncio.create_task(engine.execute(request(write=[A, B]), writer))
+            await asyncio.sleep(0)
+            self.assertEqual(await engine.execute(request([B]), total), 2)
+            self.assertEqual(await engine.execute(request([B]), total), 2)
+            readers = [asyncio.create_task(engine.execute(request([B]), total)) for _ in range(8)]
+            await asyncio.sleep(0)
+            self.assertTrue(all(not task.done() for task in readers))
+            owner.release.set()
+            await writer.entered.wait()
+            self.assertTrue(all(not task.done() for task in readers))
+            writer.release.set()
+            await asyncio.gather(first, blocked)
+            self.assertEqual(await asyncio.gather(*readers), [8] * 8)
+        self.assertEqual([e.bypassed for e in engine.events if e.bypassed], [(2,), (2,)])
+
+    async def test_only_reads_can_backfill_and_active_writer_stays_exclusive(self):
+        engine = Engine({A: (1,), B: (2,)})
+        owner = Gate({A: (6,)})
+        writer = Gate({A: (7,), B: (8,)})
+        later_writer = Gate({B: (9,)})
+        first = asyncio.create_task(engine.execute(request(write=[A]), owner))
+        async with asyncio.timeout(3):
+            await owner.entered.wait()
+            blocked = asyncio.create_task(engine.execute(request(write=[A, B]), writer))
+            await asyncio.sleep(0)
+            last = asyncio.create_task(engine.execute(request(write=[B]), later_writer))
+            await asyncio.sleep(0)
+            self.assertFalse(later_writer.entered.is_set())
+            owner.release.set()
+            await writer.entered.wait()
+            reader = asyncio.create_task(engine.execute(request([B]), total))
+            await asyncio.sleep(0)
+            self.assertFalse(reader.done())
+            writer.release.set()
+            await later_writer.entered.wait()
+            later_writer.release.set()
+            await asyncio.gather(first, blocked, last)
+            self.assertEqual(await reader, 9)
+        self.assertFalse(any(e.bypassed for e in engine.events))
+
+class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observer_failure_does_not_leak_access_or_change_outcome(self):
+        def observer(event):
+            raise RuntimeError(event.state)
+
+        engine = Engine({A: (1,)}, on_event=observer)
+
+        async def update(inputs):
+            return 5, {A: (5,)}
+
+        with self.assertLogs("core", level="ERROR") as messages:
+            async with asyncio.timeout(2):
+                self.assertEqual(await engine.execute(request(write=[A]), update), 5)
+                self.assertEqual(await engine.execute(request([A]), total), 5)
+        self.assertEqual(len(messages.records), 6)
+
+    async def test_wait_reason_is_emitted_again_when_pending_owner_starts(self):
+        engine = Engine({A: (1,), B: (2,)}, backfill_limit=0)
+        owner, writer = Gate({A: (4,)}), Gate({A: (5,), B: (6,)})
+        first = asyncio.create_task(engine.execute(request(write=[A]), owner))
+        async with asyncio.timeout(3):
+            await owner.entered.wait()
+            second = asyncio.create_task(engine.execute(request(write=[A, B]), writer))
+            await asyncio.sleep(0)
+            third = asyncio.create_task(engine.execute(request([B]), total))
+            await asyncio.sleep(0)
+            owner.release.set()
+            await writer.entered.wait()
+            await asyncio.sleep(0)
+            waits = [e.blocker for e in engine.events if e.run == 3 and e.state == "WAITING"]
+            self.assertEqual(waits, [(2, B), (2, B)])
+            writer.release.set()
+            self.assertEqual((await asyncio.gather(first, second, third))[-1], 6)
+
+    async def test_published_snapshot_remains_consistent_across_commit(self):
+        engine = Engine({A: (1,), B: (2,)})
+        writer = Gate({A: (10,), B: (20,)})
+        reader = Gate()
+        snapshot = Request("snapshot", "tester", "manual", frozenset({A, B}), frozenset(), snapshot=True)
+
+        async def held_read(inputs):
+            await reader(inputs)
+            return await total(inputs)
+
+        update = asyncio.create_task(engine.execute(request(write=[A, B]), writer))
+        async with asyncio.timeout(3):
+            await writer.entered.wait()
+            old = asyncio.create_task(engine.execute(snapshot, held_read))
+            await reader.entered.wait()
+            self.assertEqual(await engine.execute(snapshot, total), 3)
+            writer.release.set()
+            await update
+            self.assertEqual(await engine.execute(snapshot, total), 30)
+            reader.release.set()
+            self.assertEqual(await old, 3)
+        self.assertEqual([e.version for e in engine.events if e.request.snapshot and e.state == "RUNNING"],
+                         [1, 1, 2])

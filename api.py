@@ -5,12 +5,14 @@ import secrets
 from time import perf_counter_ns
 from scheduler import periodic
 from collections import OrderedDict
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from aiohttp import web
 from core import Engine, Slice
+from demo import stress_plan
 from processes import CATALOG, bind
 
 ROOT = Path(__file__).parent / "frontend"
@@ -50,23 +52,36 @@ class Service:
                                      mode="write" if key in event.request.writes else "read",
                                      owner_mode="write" if resource in other["writes"] else "read",
                                      queued=other["state"] != "RUNNING"))
+        if event.version is not None:
+            row.update(version=event.version, bypassed=event.bypassed)
         row["timing"].append([event.state, perf_counter_ns() // 1000])
         stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         row.update(state=event.state, blocker=blocker)
         row["events"].append([stamp, event.state, blocker])
         self.notify()
 
-    async def submit(self, process, day, actor, trigger="manual", delay=0, values=None):
+    async def submit(self, process, day, actor, trigger="manual", delay=0, values=None, snapshot=False):
         req, worker = bind(process, day, actor, trigger)
+        if type(snapshot) is not bool:
+            raise ValueError("invalid snapshot flag")
+        if snapshot:
+            req = replace(req, snapshot=True)
         if values is not None:
             if process != "P1" or type(values) is not list or not 1 <= len(values) <= 128:
                 raise ValueError("invalid input series")
             if any(type(n) is not int or abs(n) > 10**9 for n in values):
                 raise ValueError("invalid input number")
             series = tuple(values)
+        if values is not None:
+            async def worker(inputs):
+                return sum(series), {next(iter(req.writes)): series}
+        return await self.enqueue(req, worker, day, delay, values=values)
+
+    async def enqueue(self, req, worker, day, delay=0, *, values=None, batch=None):
         admitted = asyncio.get_running_loop().create_future()
-        row = dict(process=process, day=str(day), actor=actor, trigger=trigger, events=[], hold=delay,
-                   result=None, error=None, waits=[], timing=[], values=values,
+        row = dict(process=req.process, day=str(day), actor=req.actor, trigger=req.trigger,
+                   events=[], hold=delay, snapshot=req.snapshot, version=None, bypassed=[],
+                   result=None, error=None, waits=[], timing=[], values=values, batch=batch,
                    reads=[[k.source, str(k.day)] for k in sorted(req.reads)],
                    writes=[[k.source, str(k.day)] for k in sorted(req.writes)])
         self.pending[id(req)] = row, admitted
@@ -74,8 +89,6 @@ class Service:
         async def compute(inputs):
             if delay:
                 await asyncio.sleep(delay)
-            if values is not None:
-                return sum(series), {next(iter(req.writes)): series}
             return await worker(inputs)
 
         async def execute():
@@ -124,7 +137,7 @@ def create_app(interval=60):
             raise web.HTTPUnsupportedMediaType()
         try:
             body = await request.json()
-            if type(body) is not dict or not {"process", "day"} <= set(body) <= {"process", "day", "values", "hold"}:
+            if type(body) is not dict or not {"process", "day"} <= set(body) <= {"process", "day", "values", "hold", "snapshot"}:
                 raise ValueError()
             day = date.fromisoformat(body["day"])
             actor, _, signature = request.cookies.get("operator", "").partition(".")
@@ -133,7 +146,8 @@ def create_app(interval=60):
             hold = body.get("hold", 0)
             if type(hold) is not int or hold not in (0, 3, 8):
                 raise ValueError()
-            run = await service.submit(body["process"], day, actor, delay=hold, values=body.get("values"))
+            run = await service.submit(body["process"], day, actor, delay=hold, values=body.get("values"),
+                                       snapshot=body.get("snapshot", False))
         except (ValueError, KeyError, TypeError, OverflowError):
             raise web.HTTPBadRequest(text="Проверьте процесс и дату.")
         except BufferError:
@@ -157,17 +171,27 @@ def create_app(interval=60):
                 "writers": [("P3", DAY, 4), ("P3", DAY, 0)],
                 "queue": [("P2", DAY, 4), ("P5", DAY, 2), ("P2", DAY, 0)],
             }
-            plan = plans[scenario]
+            plan = None if scenario == "stress" else plans[scenario]
+            base_delay = .7 if plan is None else plan[0][2]
+            hold = body.get("hold", base_delay)
+            if type(hold) not in (int, float) or not .1 <= hold <= 8:
+                raise ValueError()
+            scale = hold / base_delay
         except (ValueError, AttributeError, KeyError, TypeError):
-            raise web.HTTPBadRequest(text="Неизвестный сценарий.")
+            raise web.HTTPBadRequest(text="Выберите сценарий и задержку от 0,1 до 8 секунд.")
         if demo_lock.locked() or service.jobs:
             raise web.HTTPConflict(text="Дождитесь завершения активных запусков.")
         async with demo_lock:
+            if plan is None:
+                batch = uuid4().hex
+                ids = [await service.enqueue(req, worker, day, delay * scale, batch=batch)
+                       for day, req, worker, delay in stress_plan(DAY)]
+                return web.json_response({"ids": ids}, status=202)
             ids = []
             for index, (process, day, delay) in enumerate(plan):
                 trigger = "manual" if index else "scheduled"
                 actor = f"оператор-{index}" if index else "timer"
-                ids.append(await service.submit(process, day, actor, trigger, delay))
+                ids.append(await service.submit(process, day, actor, trigger, delay * scale))
         return web.json_response({"ids": ids}, status=202)
 
     async def stream(request):

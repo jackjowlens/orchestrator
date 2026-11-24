@@ -107,3 +107,79 @@ class ManualNumbers(AioHTTPTestCase):
         for values in ([], [False], [1000000001]):
             response = await self.client.post("/api/runs", json={"process":"P1","day":"2027-01-03","values":values})
             self.assertEqual(response.status,400)
+
+class UpgradeIntegration(AioHTTPTestCase):
+    async def get_application(self):
+        return create_app()
+
+    async def test_queue_history_distinguishes_pending_from_active(self):
+        response = await self.client.post("/api/demo", json={"scenario":"queue"})
+        ids = (await response.json())["ids"]
+        async with asyncio.timeout(10):
+            while True:
+                runs = await (await self.client.get("/api/runs")).json()
+                reader = next(row for row in runs if row["id"] == ids[2])
+                if reader["state"] == "COMPLETED":
+                    break
+                await asyncio.sleep(.1)
+        self.assertEqual([(w["owner"], w["queued"]) for w in reader["waits"]],
+                         [(ids[1], True), (ids[1], False)])
+
+    async def test_snapshot_completes_while_standard_reader_waits(self):
+        response = await self.client.post("/api/demo", json={"scenario":"refresh"})
+        _, waiting, _ = (await response.json())["ids"]
+        request = {"process":"P2", "day":"2026-11-20", "snapshot":True}
+        response = await self.client.post("/api/runs", json=request)
+        self.assertEqual(response.status, 202)
+        old_id = (await response.json())["id"]
+        rejected = await self.client.post("/api/runs", json=dict(request, process="P1"))
+        self.assertEqual(rejected.status, 400)
+        async with asyncio.timeout(7):
+            while True:
+                runs = {r["id"]:r for r in await (await self.client.get("/api/runs")).json()}
+                self.assertEqual((runs[old_id]["result"], runs[old_id]["version"]), (3, 1))
+                if runs[waiting]["state"] == "COMPLETED":
+                    break
+                await asyncio.sleep(.1)
+        self.assertEqual((runs[waiting]["result"], runs[waiting]["version"]), (30, 2))
+
+class StressIntegration(AioHTTPTestCase):
+    async def get_application(self):
+        return create_app()
+
+    async def test_stress_completes_and_validates_all_partitions(self):
+        response = await self.client.post("/api/demo", json={"scenario": "stress", "hold": 0.4})
+        self.assertEqual(response.status, 202)
+        ids = (await response.json())["ids"]
+        self.assertEqual(len(ids), 120)
+        overlapping = await self.client.post("/api/demo", json={"scenario": "stress"})
+        self.assertEqual(overlapping.status, 409)
+        async with asyncio.timeout(12):
+            while True:
+                rows = await (await self.client.get("/api/runs")).json()
+                batch = [row for row in rows if row["id"] in ids]
+                if len(batch) == 120 and all(row["state"] in {"COMPLETED","FAILED","CANCELLED"} for row in batch):
+                    break
+                await asyncio.sleep(.1)
+        self.assertTrue(all(row["state"] == "COMPLETED" for row in batch))
+        self.assertEqual({len(row["writes"]) for row in batch}, {0, 4, 8})
+        self.assertEqual({row["hold"] for row in batch if row["process"] == "Seed"}, {0.4})
+        update = next(row for row in batch if row["process"] == "Update")
+        self.assertAlmostEqual(update["hold"], 0.2 * 0.4 / 0.7)
+        audits = [row for row in batch if row["process"] == "Audit"]
+        self.assertEqual([row["result"] for row in audits], [852] * 6)
+        self.assertEqual(len({tuple(key) for row in audits for key in row["reads"]}), 48)
+        self.assertGreaterEqual(sum(bool(row["waits"]) for row in batch), 100)
+
+    async def test_custom_conflict_delay_and_validation(self):
+        for hold in (0, -1, 9, True, "1", None):
+            response = await self.client.post("/api/demo", json={"scenario":"queue", "hold":hold})
+            self.assertEqual(response.status, 400)
+        response = await self.client.post("/api/demo", json={"scenario":"queue", "hold":1.2})
+        self.assertEqual(response.status, 202)
+        first, writer, last = (await response.json())["ids"]
+        rows = {row["id"]:row for row in await (await self.client.get("/api/runs")).json()}
+        self.assertEqual(rows[first]["hold"], 1.2)
+        self.assertEqual(rows[writer]["hold"], .6)
+        self.assertEqual(rows[last]["hold"], 0)
+        self.assertEqual(rows[last]["state"], "WAITING")

@@ -1,11 +1,14 @@
 """Single-event-loop scheduler for trusted asynchronous partition computations."""
 import asyncio
+import logging
 import re
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, order=True)
@@ -37,6 +40,7 @@ class Request:
     trigger: str
     reads: frozenset[Slice]
     writes: frozenset[Slice]
+    snapshot: bool = False
 
     def __post_init__(self):
         if any(type(s) is not str or not s.strip() or len(s) > 128 for s in (self.process, self.actor)):
@@ -48,8 +52,12 @@ class Request:
                 raise ValueError("expected an immutable set of slices")
         if not 1 <= len(self.reads | self.writes) <= 64:
             raise ValueError("expected 1 to 64 slices")
+        if type(self.snapshot) is not bool or (self.snapshot and self.writes):
+            raise ValueError("snapshot mode requires a read-only request")
 
     def conflicts(self, other):
+        if self.snapshot or other.snapshot:
+            return frozenset()
         return (self.writes & (other.reads | other.writes)) | (self.reads & other.writes)
 
 
@@ -61,12 +69,19 @@ class Event:
     state: str
     # One concrete (blocking run, conflicting slice) per waiting event.
     blocker: tuple[int, Slice] | None = None
+    bypassed: tuple[int, ...] = ()
+    version: int | None = None
 
 
 class Engine:
-    def __init__(self, initial: dict[Slice, Values], *, capacity=256, history=2048, on_event=None):
+    def __init__(self, initial: dict[Slice, Values], *, capacity=256, history=2048,
+                 on_event=None, backfill_limit=2):
         if any(type(n) is not int or n < 1 for n in (capacity, history)):
             raise ValueError("positive limits required")
+        if type(backfill_limit) is not int or backfill_limit < 0:
+            raise ValueError("backfill limit must be a nonnegative integer")
+        self._backfill_limit = backfill_limit
+        self._bypasses: dict[int, int] = {}
         self._on_event = on_event
         self._data = dict(initial)
         validate_data(self._data)
@@ -74,33 +89,44 @@ class Engine:
         self._events = deque(maxlen=history)
         self._pending: dict[int, Request] = {}
         self._active: dict[int, Request] = {}
-        self._finished: dict[int, asyncio.Event] = {}
+        self._state_changed: dict[int, asyncio.Event] = {}
         self._sequence = self._last_run = 0
+        self._version = 1
 
     @property
     def events(self):
         return tuple(self._events)
 
-    def _emit(self, run, req, state, blocker=None):
+    def _emit(self, run, req, state, blocker=None, *, bypassed=()):
         self._sequence += 1
-        event = Event(self._sequence, run, req, state, blocker)
+        version = self._version if state == "RUNNING" else None
+        event = Event(self._sequence, run, req, state, blocker, bypassed, version)
         self._events.append(event)
         if self._on_event is not None:
-            self._on_event(event)
+            try:
+                self._on_event(event)
+            except Exception:
+                logger.exception("Failed to deliver event %s", event.sequence)
 
     def _rank(self, run, req):
         # Ties favor FIFO: a scheduled arrival can pass four recent manual arrivals.
         return (run - (5 if req.trigger == "scheduled" else 0), run)
 
-    def _blocker(self, run, req):
+    def _admission(self, run, req):
         for owner, other in self._active.items():
             if overlap := req.conflicts(other):
-                return owner, min(overlap)
+                return (owner, min(overlap)), ()
+        bypassed = []
         for earlier, other in self._pending.items():
             if self._rank(earlier, other) < self._rank(run, req):
                 if overlap := req.conflicts(other):
-                    return earlier, min(overlap)
-        return None
+                    if (not req.writes
+                            and self._bypasses.get(earlier, 0) < self._backfill_limit
+                            and any(other.conflicts(active) - overlap for active in self._active.values())):
+                        bypassed.append(earlier)
+                    else:
+                        return (earlier, min(overlap)), ()
+        return None, tuple(bypassed)
 
     async def execute(self, req: Request, worker: Worker) -> int:
         """Call from the owning event loop. Worker selection belongs to trusted code."""
@@ -110,24 +136,34 @@ class Engine:
             raise BufferError("admission limit reached")
         self._last_run += 1
         run = self._last_run
-        self._finished[run] = asyncio.Event()
+        self._state_changed[run] = asyncio.Event()
         self._pending[run] = req
         self._emit(run, req, "QUEUED")
         try:
             previous = None
-            while blocker := self._blocker(run, req):
-                if blocker != previous:
+            blocker, bypassed = self._admission(run, req)
+            while blocker:
+                reason = blocker, blocker[0] in self._active
+                if reason != previous:
                     self._emit(run, req, "WAITING", blocker)
-                    previous = blocker
-                await self._finished[blocker[0]].wait()
+                    previous = reason
+                await self._state_changed[blocker[0]].wait()
+                blocker, bypassed = self._admission(run, req)
         except asyncio.CancelledError:
             del self._pending[run]
+            self._bypasses.pop(run, None)
             self._emit(run, req, "CANCELLED")
-            self._finished.pop(run).set()
+            self._state_changed.pop(run).set()
             raise
         del self._pending[run]
+        self._bypasses.pop(run, None)
+        for earlier in bypassed:
+            self._bypasses[earlier] = self._bypasses.get(earlier, 0) + 1
         self._active[run] = req
-        self._emit(run, req, "RUNNING")
+        pending_signal = self._state_changed[run]
+        self._state_changed[run] = asyncio.Event()
+        pending_signal.set()
+        self._emit(run, req, "RUNNING", bypassed=bypassed)
 
         # Admission, publication and release contain no suspension points.
         # Independent workers can publish during the await. Merge into current data.
@@ -138,6 +174,8 @@ class Engine:
                 raise ValueError("worker output differs from declared contract")
             validate_data(changes)
             self._data.update(changes)
+            if changes:
+                self._version += 1
             self._emit(run, req, "COMPLETED")
             return result
         except asyncio.CancelledError:
@@ -148,5 +186,5 @@ class Engine:
             raise
         finally:
             del self._active[run]
-            self._finished.pop(run).set()
+            self._state_changed.pop(run).set()
 
