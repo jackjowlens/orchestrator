@@ -115,6 +115,16 @@ class Service:
         async def execute():
             try:
                 row["result"] = await self.engine.execute(req, compute)
+            except KeyError as exc:
+                if not admitted.done():
+                    admitted.set_exception(exc)
+                    if idempotency is not None:
+                        self.submissions.pop(key, None)
+                missing = exc.args[0] if exc.args else None
+                if isinstance(missing, Slice):
+                    row["error"] = f"Нет данных для источника {missing.source} за {missing.day}. Сначала запустите P1."
+                else:
+                    row["error"] = str(exc)
             except Exception as exc:
                 if not admitted.done():
                     admitted.set_exception(exc)
