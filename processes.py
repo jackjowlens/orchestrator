@@ -45,9 +45,9 @@ class Process:
     outputs: tuple
     calculate: Callable
 
-    def bind(self, name, day, actor, trigger):
+    def bind(self, name, day, actor, trigger, prefix):
         def resolve(spec):
-            return tuple(Slice(source, day + timedelta(days=offset)) for source, offset in spec)
+            return tuple(Slice(prefix + source, day + timedelta(days=offset)) for source, offset in spec)
 
         inputs, outputs = resolve(self.inputs), resolve(self.outputs)
         req = Request(name, actor, trigger, frozenset(inputs), frozenset(outputs))
@@ -71,7 +71,7 @@ CATALOG = {
 }
 
 
-def bind(process: str, day: date, actor: str, trigger="manual") -> tuple[Request, Worker]:
+def bind(process: str, day: date, actor: str, trigger="manual", *, prefix="") -> tuple[Request, Worker]:
     if type(day) is not date:
         raise ValueError("expected calendar date")
-    return CATALOG[process].bind(process, day, actor, trigger)
+    return CATALOG[process].bind(process, day, actor, trigger, prefix)

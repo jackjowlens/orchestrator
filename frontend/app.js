@@ -1,11 +1,19 @@
 const $ = s => document.querySelector(s);
-const stressNames={Seed:"Загрузка 8 срезов",Update:"Обновление 4 срезов",Read:"Чтение 3 срезов",Audit:"Проверка 8 срезов"};
+const stressNames={DemoSeed:"Подготовка демоданных",Seed:"Загрузка 8 срезов",Update:"Обновление 4 срезов",Read:"Чтение 3 срезов",Audit:"Проверка 8 срезов"};
 const labels = {QUEUED:"В очереди",WAITING:"Ожидает",RUNNING:"В работе",COMPLETED:"Завершён",FAILED:"Ошибка",CANCELLED:"Отменён"};
 let rows=[], catalog=[], selected=null, selectedCell=null;
-const sliceName=source=>/^Load\d+$/.test(source)?"Источник "+(Number(source.slice(4))+1):source;
+const sliceName=source=>source.startsWith("Demo_")?"Демо "+source.slice(5):source==="Timer_A"?"Регламент A":/^Load\d+$/.test(source)?"Источник "+(Number(source.slice(4))+1):source;
 const sliceText=([source,day])=>sliceName(source)+" / "+day;
 const processName=id=>stressNames[id]??([id,catalog.find(p=>p.id===id)?.name].filter(Boolean).join(" · "));
 const actorName=id=>id.replace(/^stress-(\d+)$/,"Участник $1").replace(/^audit$/,"Проверка").replace(/^timer$/,"Таймер");
+const moscowClock=new Intl.DateTimeFormat("sv-SE",{
+  timeZone:"Europe/Moscow",year:"numeric",month:"2-digit",day:"2-digit",
+  hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"
+});
+function timestamp(stamp){
+  const instant=new Date(stamp);
+  return moscowClock.format(instant)+"."+String(instant.getUTCMilliseconds()).padStart(3,"0");
+}
 function element(tag,text,cls){
   const node=document.createElement(tag); node.textContent=text;
   if(cls) node.className=cls; return node;
@@ -25,7 +33,7 @@ function render(){
   for(const r of rows){
     const tr=element("tr","",r.id===selected?"selected":"");
     const id=element("td",""); id.append(linkRun(r.id)); tr.append(id);
-    tr.append(element("td",processName(r.process)),element("td",r.day),
+    tr.append(element("td",processName(r.process)),element("td",timestamp(r.events[0][0])),
       element("td",labels[r.state],r.state),element("td",r.result??"—"));
     body.append(tr);
   }
@@ -62,28 +70,38 @@ function render(){
   if(r.result!==null)detail.append(element("p","Результат · "+r.result));
   const history=element("ol","");
   for(const [stamp,state,blocker] of r.events){
-    history.append(element("li",new Date(stamp).toLocaleTimeString("ru")+"  "+labels[state]+(blocker?" · "+blocker.replace(/Load\d+/g,sliceName):"")));
+    history.append(element("li",timestamp(stamp)+"  "+labels[state]+(blocker?" · "+blocker.replace(/Load\d+/g,sliceName):"")));
   }
   detail.append(history);
 }
-async function post(path,data){
-  const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
-  if(!res.ok)throw Error(await res.text()); return res.json();
+async function post(path,data,key){
+  const headers={"Content-Type":"application/json"};
+  if(key)headers["Idempotency-Key"]=key;
+  const send=()=>fetch(path,{method:"POST",headers,body:JSON.stringify(data)});
+  let res;
+  try{res=await send()}
+  catch(error){
+    if(!key || !(error instanceof TypeError))throw error;
+    res=await send();
+  }
+  if(!res.ok)throw Error(await res.text());
+  return res.json();
 }
 async function action(button,fn){
   button.disabled=true; $("#message").textContent="";
   try{await fn();render()}catch(err){$("#message").textContent=err.message}finally{button.disabled=false}
 }
 $("form").onsubmit=e=>{e.preventDefault();action($(".primary"),async()=>{
-  const data={process:$("#process").value,day:$("#day").value,hold:Number($("#hold").value)};
-  if(!$("#read-policy").hidden)data.snapshot=$("#snapshot").value==="true";
+  const options=$("#launch-options").open;
+  const data={process:$("#process").value,day:$("#day").value,hold:options?Number($("#hold").value):0};
+  if(options && !$("#read-policy").hidden)data.snapshot=$("#snapshot").value==="true";
   if(data.process==="P1"){
     const input=$("#values").value.trim();
     if(!/^-?\d+(?:[\s,;]+-?\d+)*$/.test(input))throw Error("Введите целые числа через запятую или пробел.");
     data.values=input.split(/[\s,;]+/).map(Number);
     if(data.values.length>128 || data.values.some(n=>Math.abs(n)>1e9))throw Error("До 128 чисел от −1 млрд до 1 млрд.");
   }
-  selected=(await post("/api/runs",data)).id;
+  selected=(await post("/api/runs",data,crypto.randomUUID())).id;
 })};
 $("#demo").onclick=()=>{
   const hold=$("#scenario-hold");
@@ -328,33 +346,54 @@ function renderCells(){
   }
   matrix.append(table);
   const cell=cells.get(selectedCell);
-  detail.append(element("h3",sliceText([cell.source,cell.day])));
+  const heading=element("div","","cell-summary");
+  heading.append(element("h3",sliceText([cell.source,cell.day])));
+  const totals=element("dl","","cell-totals");
   const waits=cell.waits.filter(w=>w.end!==undefined);
   const total=waits.reduce((sum,w)=>sum+(w.end-w.start),0);
-  detail.append(element("p",new Set(cell.waits.map(w=>w.run.id)).size+
-    " запусков ждали этот срез · "+duration(total)+" суммарного завершённого ожидания"));
-  function group(title,runs){
-    const line=element("p",title+" ");
-    if(!runs.length)line.append("—");
-    for(const r of runs){
-      const link=linkRun(r.id);
-      link.title=processName(r.process);
-      line.append(link," ");
-    }
-    detail.append(line);
+  for(const [label,value] of [
+    ["Задач ждали",new Set(cell.waits.map(w=>w.run.id)).size],
+    ["Сумма завершённых ожиданий",duration(total)]
+  ]){
+    const metric=element("div","");
+    metric.append(element("dt",label),element("dd",String(value)));
+    totals.append(metric);
   }
-  group("Пишут сейчас",cell.writes.filter(r=>r.state==="RUNNING"));
-  group("Читают сейчас",cell.reads.filter(r=>r.state==="RUNNING"&&!r.snapshot));
-  if(cell.reads.some(r=>r.state==="RUNNING"&&r.snapshot))
-    group("Читают опубликованный снимок",cell.reads.filter(r=>r.state==="RUNNING"&&r.snapshot));
-  const pending=cell.waits.filter(w=>w.end===undefined);
-  if(!pending.length)detail.append(element("p","Ждут сейчас —"));
-  for(const {run,wait} of pending){
-    const line=element("p","");
-    line.append(linkRun(run.id),wait.queued?" ждёт своей очереди за ":" ждёт освобождения среза от ",linkRun(wait.owner));
-    detail.append(line);
+  heading.append(totals);
+  const panels=element("div","","cell-panels");
+  const live=element("section","","cell-panel"), history=element("section","","cell-panel");
+  live.append(element("h4","Сейчас"));
+  history.append(element("h4","Завершённые операции"));
+  panels.append(live,history);
+  detail.append(heading,panels);
+
+  function group(panel,title,items){
+    const row=element("div","","cell-row");
+    const values=element("div","","cell-links");
+    if(!items.length)values.append(element("span","—","cell-empty"));
+    values.append(...items);
+    row.append(element("span",title,"cell-label"),values);
+    panel.append(row);
   }
-  const committed=runs=>runs.filter(r=>r.state==="COMPLETED");
-  group("Завершённые чтения",committed(cell.reads));
-  group("Завершённые записи",committed(cell.writes));
+  function links(runs){
+    return runs.map(run=>{
+      const link=linkRun(run.id);
+      link.title=processName(run.process);
+      return link;
+    });
+  }
+  const running=run=>run.state==="RUNNING";
+  group(live,"Пишут",links(cell.writes.filter(running)));
+  group(live,"Читают",links(cell.reads.filter(run=>running(run)&&!run.snapshot)));
+  const snapshots=cell.reads.filter(run=>running(run)&&run.snapshot);
+  const pending=cell.waits.filter(wait=>wait.end===undefined).map(({run,wait})=>{
+    const reason=element("div","","cell-reason");
+    reason.append(linkRun(run.id),element("span",wait.queued?"за заявкой":"ждёт снятия блокировки"),linkRun(wait.owner));
+    return reason;
+  });
+  group(live,"Ждут",pending);
+  if(snapshots.length)group(live,"Читают снимок",links(snapshots));
+  const committed=run=>run.state==="COMPLETED";
+  group(history,"Чтения",links(cell.reads.filter(committed)));
+  group(history,"Записи",links(cell.writes.filter(committed)));
 }

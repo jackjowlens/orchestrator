@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import secrets
 from time import perf_counter_ns
 from scheduler import periodic
@@ -8,12 +9,12 @@ from collections import OrderedDict
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from aiohttp import web
-from core import Engine, Slice
+from core import Engine, Request, Slice
 from demo import stress_plan
-from processes import CATALOG, bind
+from processes import CATALOG, bind, update
 
 ROOT = Path(__file__).parent / "frontend"
 DAY = date(2026, 11, 20)
@@ -25,6 +26,7 @@ class Service:
     def __init__(self):
         self.rows = OrderedDict()
         self.pending = {}
+        self.submissions = OrderedDict()
         self.jobs = set()
         self.changed = asyncio.Event()
         data = {Slice("A", DAY): (1, 2), Slice("A", DAY - timedelta(days=1)): (4, 5),
@@ -60,8 +62,8 @@ class Service:
         row["events"].append([stamp, event.state, blocker])
         self.notify()
 
-    async def submit(self, process, day, actor, trigger="manual", delay=0, values=None, snapshot=False):
-        req, worker = bind(process, day, actor, trigger)
+    async def submit(self, process, day, actor, trigger="manual", delay=0, values=None, snapshot=False, idempotency=None, prefix=""):
+        req, worker = bind(process, day, actor, trigger, prefix=prefix)
         if type(snapshot) is not bool:
             raise ValueError("invalid snapshot flag")
         if snapshot:
@@ -75,9 +77,24 @@ class Service:
         if values is not None:
             async def worker(inputs):
                 return sum(series), {next(iter(req.writes)): series}
-        return await self.enqueue(req, worker, day, delay, values=values)
+        return await self.enqueue(req, worker, day, delay, values=values, idempotency=idempotency)
 
-    async def enqueue(self, req, worker, day, delay=0, *, values=None, batch=None):
+    async def enqueue(self, req, worker, day, delay=0, *, values=None, batch=None,
+                      idempotency=None):
+        if idempotency is not None:
+            key, fingerprint = idempotency
+            if key in self.submissions:
+                original, accepted = self.submissions[key]
+                if original != fingerprint:
+                    raise web.HTTPConflict(text="Этот ключ уже использован для другой заявки.")
+                return await asyncio.shield(accepted)
+            if len(self.submissions) >= 512:
+                for old_key, (_, accepted) in self.submissions.items():
+                    if accepted.done():
+                        del self.submissions[old_key]
+                        break
+                else:
+                    raise BufferError("admission limit reached")
         admitted = asyncio.get_running_loop().create_future()
         row = dict(process=req.process, day=str(day), actor=req.actor, trigger=req.trigger,
                    events=[], hold=delay, snapshot=req.snapshot, version=None, bypassed=[],
@@ -85,6 +102,10 @@ class Service:
                    reads=[[k.source, str(k.day)] for k in sorted(req.reads)],
                    writes=[[k.source, str(k.day)] for k in sorted(req.writes)])
         self.pending[id(req)] = row, admitted
+        if idempotency is not None:
+            self.submissions[key] = fingerprint, admitted
+            # A disconnected client may leave the admission future unwatched.
+            admitted.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
 
         async def compute(inputs):
             if delay:
@@ -97,6 +118,8 @@ class Service:
             except Exception as exc:
                 if not admitted.done():
                     admitted.set_exception(exc)
+                    if idempotency is not None:
+                        self.submissions.pop(key, None)
                 row["error"] = str(exc)
             finally:
                 self.pending.pop(id(req), None)
@@ -146,8 +169,17 @@ def create_app(interval=60):
             hold = body.get("hold", 0)
             if type(hold) is not int or hold not in (0, 3, 8):
                 raise ValueError()
+            header = request.headers.get("Idempotency-Key")
+            idempotency = None
+            if header is not None:
+                if len(header) != 36 or str(UUID(header)) != header:
+                    raise ValueError()
+                fingerprint = json.dumps(body, sort_keys=True, separators=(",", ":"))
+                idempotency = header, fingerprint
             run = await service.submit(body["process"], day, actor, delay=hold, values=body.get("values"),
-                                       snapshot=body.get("snapshot", False))
+                                       snapshot=body.get("snapshot", False), idempotency=idempotency)
+            if idempotency is not None and run in service.rows:
+                actor = service.rows[run]["actor"]
         except (ValueError, KeyError, TypeError, OverflowError):
             raise web.HTTPBadRequest(text="Проверьте процесс и дату.")
         except BufferError:
@@ -187,15 +219,22 @@ def create_app(interval=60):
                 ids = [await service.enqueue(req, worker, day, delay * scale, batch=batch)
                        for day, req, worker, delay in stress_plan(DAY)]
                 return web.json_response({"ids": ids}, status=202)
+            initial = {Slice("Demo_A", DAY): (1, 2), Slice("Demo_A", yesterday): (4, 5),
+                       Slice("Demo_B", DAY): (7,), Slice("Demo_B", yesterday): (6,)}
+
+            async def prepare(inputs):
+                return len(initial), initial
+
+            seed = Request("DemoSeed", "demo", "scheduled", frozenset(), frozenset(initial))
+            await service.enqueue(seed, prepare, DAY)
             ids = []
             for index, (process, day, delay) in enumerate(plan):
                 trigger = "manual" if index else "scheduled"
                 actor = f"оператор-{index}" if index else "timer"
-                ids.append(await service.submit(process, day, actor, trigger, delay * scale))
+                ids.append(await service.submit(process, day, actor, trigger, delay * scale, prefix="Demo_"))
         return web.json_response({"ids": ids}, status=202)
 
     async def stream(request):
-        import json
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream","Cache-Control": "no-cache"})
         await response.prepare(request)
         try:
@@ -229,8 +268,17 @@ def create_app(interval=60):
     app.router.add_post("/api/demo", demo)
     app.router.add_get("/api/events", stream)
     async def clock(app):
+        key = Slice("Timer_A", DAY)
+        req, _ = bind("P1", DAY, "timer", "scheduled")
+        req = replace(req, writes=frozenset({key}))
+
+        async def refresh(inputs):
+            result, (values,) = update()
+            return result, {key: values}
+
         async def tick():
-            await service.submit("P1", DAY, "timer", "scheduled")
+            # Each admission uses its own request identity for event correlation.
+            await service.enqueue(replace(req), refresh, DAY)
         timer = asyncio.create_task(periodic(interval, tick))
         try:
             yield

@@ -1,8 +1,29 @@
-<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Оркестратор · Запуски</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head><body>
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Оркестратор · Запуски</title><link rel="stylesheet" href="/style.css?v=launch-options"><script defer src="/app.js?v=queue-time"></script></head><body>
 <nav><b>Оркестратор</b><a href="#overview">Обзор</a><a href="#launch">Новый запуск</a><a href="#cells">Срезы</a><a href="#chart">Диаграмма</a><a href="#flows">Конфликты</a><a href="#queue">Журнал</a></nav><header id="overview"><strong><span class="mark">≋</span> Оркестратор</strong><span id="connection" role="status">Подключение…</span></header>
 <main><section class="title"><h1>Запуски процессов</h1></section>
-<section class="metrics"><article>Выполняются<strong id="running">0</strong></article><article>Ждут ресурс<strong id="waiting">0</strong></article><article>Последний расчёт<strong id="latency">—</strong></article></section><section class="scenarios"><div><h2>Разбор конфликтов</h2><label>Сценарий<select id="scenario"><option value="refresh">Чтение во время обновления</option><option value="window">Пересечение соседних дат</option><option value="writers">Две записи в общий результат</option><option value="queue">Читатель за ожидающим писателем</option><option value="stress">Стресс-тест · 120 запусков</option></select></label></div><p id="scenarioDesc"></p><label>Задержка, с<input id="scenario-hold" type="number" min="0.1" max="8" step="0.1" required></label><button id="demo">▷ Запустить сценарий</button></section>
-<form id="launch"><h2>Новый запуск</h2><label>Процесс<select id="process" required></select></label><label>Расчётная дата<input type="date" id="day" value="2026-11-20" required></label><label id="numbers">Числа для записи в A<input id="values" value="10, 20" maxlength="1600" placeholder="Например: 4, -2, 15"></label><label>Удержание среза<select id="hold"><option value="0">Без задержки</option><option value="3">3 с · демонстрация</option><option value="8">8 с · демонстрация</option></select></label><label id="read-policy" hidden>Данные<select id="snapshot"><option value="false">Дождаться обновления</option><option value="true">Прочитать опубликованную версию</option></select></label><button class="primary">Запустить</button><small id="resources"></small></form><p id="message" role="status"></p>
+<section class="metrics"><article>Выполняются<strong id="running">0</strong></article><article>Ждут ресурс<strong id="waiting">0</strong></article><article>Последний расчёт<strong id="latency">—</strong></article></section>
+<form id="launch">
+  <h2>Новый запуск</h2>
+  <div class="launch-fields">
+    <label>Процесс<select id="process" required></select></label>
+    <label>Расчётная дата<input type="date" id="day" value="2026-11-20" required></label>
+    <label id="numbers">Числа для записи в A<input id="values" value="10, 20" maxlength="1600" placeholder="Например: 4, -2, 15"></label>
+    <button class="primary">Запустить</button>
+  </div>
+  <small id="resources"></small>
+  <details id="launch-options">
+    <summary>Дополнительные настройки</summary>
+    <div class="launch-fields">
+      <label>Задержка для демо<select id="hold">
+        <option value="0">Без задержки</option><option value="3">3 с</option><option value="8">8 с</option>
+      </select></label>
+      <label id="read-policy" hidden>Данные для чтения<select id="snapshot">
+        <option value="false">Дождаться обновления</option><option value="true">Читать опубликованную версию сразу</option>
+      </select></label>
+    </div>
+  </details>
+</form>
+<section class="scenarios"><div><h2>Демонстрационные сценарии</h2><label>Сценарий<select id="scenario"><option value="refresh">Чтение во время обновления</option><option value="window">Пересечение соседних дат</option><option value="writers">Две записи в общий результат</option><option value="queue">Читатель за ожидающим писателем</option><option value="stress">Стресс-тест · 120 запусков</option></select></label></div><small>Свои срезы и исходные значения для каждого прогона.</small><p id="scenarioDesc"></p><label>Задержка, с<input id="scenario-hold" type="number" min="0.1" max="8" step="0.1" required></label><button id="demo">▷ Запустить сценарий</button></section><p id="message" role="status"></p>
 <section class="conflicts" id="stress-report" hidden><h2>Последний стресс-прогон</h2><div id="stress-metrics"></div></section><section class="conflicts" id="cells"><h2>Матрица срезов</h2>
 <div class="cell-legend"><span>Ч · читатели</span><span>З · записи</span><span>О · ожидания</span></div>
-<div id="cell-matrix" class="scroll"></div><div id="cell-detail"></div></section><section id="chart"><h2>Время запусков</h2><p class="legend"><i></i> Выполнение <i></i> Ожидание · свободное пространство между полосами показывает интервалы без активности показанных задач</p><div id="timeline"></div></section><section class="conflicts"><h2>Связи ожидания</h2><div id="flows"></div></section><div class="grid" id="queue"><section><div class="section"><h2>Очередь запусков</h2><span id="count"></span></div><div class="scroll"><table><thead><tr><th>Запуск</th><th>Процесс</th><th>Дата</th><th>Состояние</th><th>Результат</th></tr></thead><tbody></tbody></table></div><p id="empty">Запусков пока нет. Выберите процесс или запустите демо.</p></section><aside><h2>Детали запуска</h2><div id="detail">Выберите запуск в очереди.</div></aside></div></main></body></html>
+<div id="cell-matrix" class="scroll"></div><div id="cell-detail"></div></section><section id="chart"><h2>Время запусков</h2><p class="legend"><i></i> Выполнение <i></i> Ожидание · свободное пространство между полосами показывает интервалы без активности показанных задач</p><div id="timeline"></div></section><section class="conflicts"><h2>Связи ожидания</h2><div id="flows"></div></section><div class="grid" id="queue"><section><div class="section"><h2>Очередь запусков</h2><span id="count"></span></div><div class="scroll"><table><thead><tr><th>Запуск</th><th>Процесс</th><th>Подана, МСК</th><th>Состояние</th><th>Результат</th></tr></thead><tbody></tbody></table></div><p id="empty">Запусков пока нет. Выберите процесс или запустите демо.</p></section><aside><h2>Детали запуска</h2><div id="detail">Выберите запуск в очереди.</div></aside></div></main></body></html>

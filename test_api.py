@@ -35,7 +35,7 @@ class Integration(AioHTTPTestCase):
                     state = await frame()
                 self.assertEqual(state[waiting]["result"], 30)
             snapshot = await (await self.client.get("/api/runs")).json()
-            self.assertEqual(len(snapshot), 3)
+            self.assertEqual(len(snapshot), 4)
             async with self.client.get("/api/events") as fresh:
                 self.assertEqual(json.loads((await fresh.content.readline())[6:]), snapshot)
 
@@ -77,7 +77,7 @@ class ConflictIntegration(AioHTTPTestCase):
                 await asyncio.sleep(.2)
         wait = rows[ids[reader]]["waits"][0]
         self.assertEqual((wait["owner"],wait["resource"][0],wait["queued"]),
-                         (ids[owner],source,queued))
+                         (ids[owner],"Demo_"+source,queued))
         return wait
 
     async def test_writers(self):
@@ -126,8 +126,9 @@ class UpgradeIntegration(AioHTTPTestCase):
                          [(ids[1], True), (ids[1], False)])
 
     async def test_snapshot_completes_while_standard_reader_waits(self):
-        response = await self.client.post("/api/demo", json={"scenario":"refresh"})
-        _, waiting, _ = (await response.json())["ids"]
+        await self.client.post("/api/runs", json={"process":"P1","day":"2026-11-20","hold":3})
+        response = await self.client.post("/api/runs", json={"process":"P2","day":"2026-11-20"})
+        waiting = (await response.json())["id"]
         request = {"process":"P2", "day":"2026-11-20", "snapshot":True}
         response = await self.client.post("/api/runs", json=request)
         self.assertEqual(response.status, 202)
@@ -183,3 +184,70 @@ class StressIntegration(AioHTTPTestCase):
         self.assertEqual(rows[writer]["hold"], .6)
         self.assertEqual(rows[last]["hold"], 0)
         self.assertEqual(rows[last]["state"], "WAITING")
+
+class SubmissionIntegration(AioHTTPTestCase):
+    async def get_application(self):
+        return create_app(interval=.05)
+
+    async def test_concurrent_retry_applies_update_once(self):
+        from uuid import uuid4
+
+        day = "2026-11-20"
+        seed = await self.client.post("/api/runs", json={"process": "P1", "day": day, "values": [100]})
+        self.assertEqual(seed.status, 202)
+        data = {"process": "P5", "day": day}
+        headers = {"Idempotency-Key": str(uuid4())}
+        first, second = await asyncio.gather(
+            self.client.post("/api/runs", json=data, headers=headers),
+            self.client.post("/api/runs", json=data, headers=headers),
+        )
+        self.assertEqual((first.status, second.status), (202, 202))
+        self.assertEqual(await first.json(), await second.json())
+        conflict = await self.client.post("/api/runs", json=dict(data, hold=3), headers=headers)
+        self.assertEqual(conflict.status, 409)
+        retry = await self.client.post("/api/runs", json=data, headers=headers)
+        self.assertEqual(await retry.json(), await first.json())
+        independent = await self.client.post("/api/runs", json=data,
+                                             headers={"Idempotency-Key": str(uuid4())})
+        self.assertNotEqual(await independent.json(), await first.json())
+        rows = await (await self.client.get("/api/runs")).json()
+        self.assertEqual([r["result"] for r in reversed(rows) if r["process"] == "P5"], [101, 102])
+
+    async def test_timer_keeps_manual_values(self):
+        day = "2026-11-20"
+        response = await self.client.post("/api/runs", json={"process": "P1", "day": day, "values": [100]})
+        self.assertEqual(response.status, 202)
+        async with asyncio.timeout(2):
+            while True:
+                rows = await (await self.client.get("/api/runs")).json()
+                timer = next((r for r in rows if r["trigger"] == "scheduled" and r["state"] == "COMPLETED"), None)
+                if timer:
+                    break
+                await asyncio.sleep(.01)
+        self.assertEqual(timer["writes"], [["Timer_A", day]])
+        response = await self.client.post("/api/runs", json={"process": "P2", "day": day})
+        run_id = (await response.json())["id"]
+        rows = await (await self.client.get("/api/runs")).json()
+        self.assertEqual(next(r["result"] for r in rows if r["id"] == run_id), 100)
+
+class DemoIsolation(AioHTTPTestCase):
+    async def get_application(self):
+        return create_app()
+
+    async def test_repeatable_scenarios_preserve_manual_data(self):
+        await self.client.post("/api/runs", json={"process":"P1","day":"2026-11-19","values":[100]})
+        for scenario, expected in [("window",[11,-8,3]), ("window",[11,-8,3]), ("refresh",[30,30,9])]:
+            response = await self.client.post("/api/demo", json={"scenario":scenario,"hold":.1})
+            self.assertEqual(response.status, 202)
+            ids = (await response.json())["ids"]
+            async with asyncio.timeout(3):
+                while True:
+                    rows = {r["id"]:r for r in await (await self.client.get("/api/runs")).json()}
+                    if all(rows[i]["state"]=="COMPLETED" for i in ids):
+                        break
+                    await asyncio.sleep(.01)
+            self.assertEqual([rows[i]["result"] for i in ids], expected)
+        response = await self.client.post("/api/runs", json={"process":"P2","day":"2026-11-19"})
+        run = (await response.json())["id"]
+        rows = await (await self.client.get("/api/runs")).json()
+        self.assertEqual(next(r["result"] for r in rows if r["id"]==run),100)
