@@ -73,6 +73,14 @@ function render(){
     history.append(element("li",timestamp(stamp)+"  "+labels[state]+(blocker?" · "+blocker.replace(/Load\d+/g,sliceName):"")));
   }
   detail.append(history);
+  if(["QUEUED","WAITING","RUNNING"].includes(r.state)){
+    const cancel=element("button","Отменить запуск #"+r.id,"cancel-run");
+    cancel.onclick=()=>action(cancel,async()=>{
+      await post("/api/runs/"+r.id+"/cancel",{});
+      selected=r.id;
+    });
+    detail.append(cancel);
+  }
 }
 async function post(path,data,key){
   const headers={"Content-Type":"application/json"};

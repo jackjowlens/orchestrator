@@ -28,6 +28,7 @@ class Service:
         self.pending = {}
         self.submissions = OrderedDict()
         self.jobs = set()
+        self.by_run = {}
         self.changed = asyncio.Event()
         data = {Slice("A", DAY): (1, 2), Slice("A", DAY - timedelta(days=1)): (4, 5),
                 Slice("B", DAY): (7,), Slice("B", DAY - timedelta(days=1)): (6,)}
@@ -42,6 +43,7 @@ class Service:
             row, admitted = self.pending.pop(id(event.request))
             row["id"] = event.run
             self.rows[event.run] = row
+            self.by_run[event.run] = asyncio.current_task()
             admitted.set_result(event.run)
         row = self.rows[event.run]
         blocker = None
@@ -132,6 +134,7 @@ class Service:
                         self.submissions.pop(key, None)
                 row["error"] = str(exc)
             finally:
+                self.by_run.pop(row.get('id'), None)
                 self.pending.pop(id(req), None)
                 if len(self.rows) > 400:
                     for key in list(self.rows):
@@ -197,6 +200,21 @@ def create_app(interval=60):
         response = web.json_response({"id": run}, status=202)
         response.set_cookie("operator", actor + "." + sign(actor), httponly=True, samesite="Strict")
         return response
+
+    async def cancel(request):
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType()
+        run = int(request.match_info["run"])
+        row = service.rows.get(run)
+        if row is None:
+            raise web.HTTPNotFound(text="Запуск не найден.")
+        task = service.by_run.get(run)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if row["state"] != "CANCELLED":
+            raise web.HTTPConflict(text="Этот запуск уже завершился.")
+        return web.json_response({"id": run, "state": row["state"]})
 
     demo_lock = asyncio.Lock()
 
@@ -275,6 +293,7 @@ def create_app(interval=60):
     app.router.add_get("/api/catalog", catalog)
     app.router.add_get("/api/runs", runs)
     app.router.add_post("/api/runs", submit)
+    app.router.add_post(r"/api/runs/{run:[0-9]{1,18}}/cancel", cancel)
     app.router.add_post("/api/demo", demo)
     app.router.add_get("/api/events", stream)
     async def clock(app):

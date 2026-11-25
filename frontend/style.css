@@ -41,3 +41,4 @@
 #launch-options summary { color: #2457ad; cursor: pointer; width: fit-content; }
 #launch-options .launch-fields { margin-top: 12px; }
 #launch-options:not([open]) > .launch-fields { display: none; }
+.cancel-run{color:#953d29;border-color:#ceaa9e}.glossary{display:grid;grid-template-columns:minmax(150px,1fr) 4fr;gap:12px 20px}.glossary dt{font-weight:600}.glossary dd{margin:0;max-width:78ch}@media(max-width:600px){.glossary{grid-template-columns:1fr;gap:3px}.glossary dd{margin-bottom:10px}}

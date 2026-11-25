@@ -251,3 +251,31 @@ class DemoIsolation(AioHTTPTestCase):
         run = (await response.json())["id"]
         rows = await (await self.client.get("/api/runs")).json()
         self.assertEqual(next(r["result"] for r in rows if r["id"]==run),100)
+
+class CancelIntegration(AioHTTPTestCase):
+    async def get_application(self):
+        return create_app()
+
+    async def test_cancel_waiter_then_owner(self):
+        response = await self.client.post("/api/demo", json={"scenario":"refresh","hold":8})
+        owner, waiter, completed = (await response.json())["ids"]
+        for run in (waiter, waiter, owner):
+            response = await self.client.post(f"/api/runs/{run}/cancel", json={})
+            self.assertEqual(response.status, 200)
+        response = await self.client.post(f"/api/runs/{completed}/cancel", json={})
+        self.assertEqual(response.status, 409)
+        rows = {r["id"]:r for r in await (await self.client.get("/api/runs")).json()}
+        self.assertEqual(rows[waiter]["state"], "CANCELLED")
+        self.assertEqual(rows[owner]["state"], "CANCELLED")
+
+    async def test_cancel_writer_releases_waiting_reader(self):
+        response = await self.client.post("/api/demo", json={"scenario":"refresh","hold":8})
+        owner, reader, _ = (await response.json())["ids"]
+        await self.client.post(f"/api/runs/{owner}/cancel", json={})
+        async with asyncio.timeout(2):
+            while True:
+                rows = {r["id"]:r for r in await (await self.client.get("/api/runs")).json()}
+                if rows[reader]["state"]=="COMPLETED":
+                    break
+                await asyncio.sleep(.01)
+        self.assertEqual(rows[reader]["result"], 3)
